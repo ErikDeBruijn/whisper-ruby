@@ -36,21 +36,28 @@ module Whisper
     end
 
     def transcribe_with_speakers(input_path, language: "auto",
-                                  min_speakers: nil, max_speakers: nil, speaker_names: {},
-                                  on_progress: nil)
+                                  min_speakers: nil, max_speakers: nil, threshold: 0.6,
+                                  speaker_names: {}, voice_profiles: nil, on_progress: nil)
       # 1. Diarize first — speaker segments are leading
       on_progress&.call(:diarize, 0, 1, 0.0, 0.0)
       diarization = Diarization.diarize(
         input_path,
         min_speakers: min_speakers,
-        max_speakers: max_speakers
+        max_speakers: max_speakers,
+        threshold: threshold
       )
       on_progress&.call(:diarize, 1, 1, 0.0, 0.0)
 
-      # 2. Merge adjacent segments from same speaker to reduce whisper calls
+      # 2. Resolve voice profiles to speaker names if embeddings are available
+      if voice_profiles && diarization[:speaker_embeddings]
+        profile_names = voice_profiles.resolve(diarization[:speaker_embeddings])
+        speaker_names = profile_names.merge(speaker_names)
+      end
+
+      # 3. Merge adjacent segments from same speaker to reduce whisper calls
       speaker_segments = Diarization.merge_adjacent(diarization[:segments])
 
-      # 3. Transcribe each speaker segment
+      # 4. Transcribe each speaker segment
       results = Dir.mktmpdir("whisper_") do |tmpdir|
         speaker_segments.each_with_index.map do |seg, i|
           chunk_path = File.join(tmpdir, format("chunk_%03d.wav", i))
