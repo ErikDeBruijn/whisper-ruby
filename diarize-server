@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Lightweight speaker diarization server using SpeechBrain ECAPA-TDNN.
+
+No HuggingFace gated model access required — uses the freely available
+speechbrain/spkrec-ecapa-voxceleb model for speaker embeddings and
+agglomerative clustering to group segments by speaker.
+
+Usage:
+    ./diarize-server                    # start on port 8100
+    ./diarize-server --port 8200        # custom port
+    DIARIZE_DEVICE=mps ./diarize-server # use Apple Silicon GPU
+
+API:
+    POST /diarize
+      - file: audio file (any format ffmpeg supports)
+      - min_speakers: (optional) minimum number of speakers
+      - max_speakers: (optional) maximum number of speakers
+      - threshold: (optional) clustering threshold, default 0.6
+    Returns JSON: {"speakers": 2, "segments": [{"start": 0.0, "end": 3.5, "speaker": "SPEAKER_00"}, ...]}
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import cgi
+
+import numpy as np
+import torch
+import torchaudio
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import pdist
+from speechbrain.inference.speaker import EncoderClassifier
+
+DEVICE = os.environ.get("DIARIZE_DEVICE", "cpu")
+SAMPLE_RATE = 16000
+MIN_SEGMENT_DURATION = 1.0  # seconds - segments shorter than this are merged with neighbors
+EMBEDDING_WINDOW = 1.5  # seconds - window size for embedding extraction
+
+
+class DiarizationEngine:
+    def __init__(self, device="cpu"):
+        self.device = device
+        self.classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": device}
+        )
+
+    def detect_speech_segments(self, audio_path, noise_db=-30, min_silence=0.5):
+        """Detect speech segments using ffmpeg silencedetect (inverse: find non-silent parts)."""
+        result = subprocess.run(
+            ["ffmpeg", "-i", audio_path,
+             "-af", f"silencedetect=noise={noise_db}dB:d={min_silence}",
+             "-f", "null", "-"],
+            capture_output=True, text=True
+        )
+
+        # Get total duration
+        dur_result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path],
+            capture_output=True, text=True
+        )
+        total_duration = float(dur_result.stdout.strip())
+
+        # Parse silence periods
+        silences = []
+        pending_start = None
+        for line in result.stderr.splitlines():
+            import re
+            m = re.search(r"silence_start: ([\d.]+)", line)
+            if m:
+                pending_start = float(m.group(1))
+            m = re.search(r"silence_end: ([\d.]+)", line)
+            if m and pending_start is not None:
+                silences.append((pending_start, float(m.group(1))))
+                pending_start = None
+
+        # Invert silences to get speech segments
+        speech = []
+        pos = 0.0
+        for sil_start, sil_end in silences:
+            if sil_start > pos + MIN_SEGMENT_DURATION:
+                speech.append((pos, sil_start))
+            pos = sil_end
+        if total_duration > pos + MIN_SEGMENT_DURATION:
+            speech.append((pos, total_duration))
+
+        return speech
+
+    def extract_embeddings(self, waveform, sr, segments):
+        """Extract a speaker embedding for each speech segment."""
+        embeddings = []
+        valid_segments = []
+
+        for start, end in segments:
+            start_sample = int(start * sr)
+            end_sample = int(end * sr)
+            segment_audio = waveform[:, start_sample:end_sample]
+
+            if segment_audio.shape[1] < sr * 0.5:  # skip very short segments
+                continue
+
+            # Extract embedding
+            with torch.no_grad():
+                embedding = self.classifier.encode_batch(segment_audio.to(self.device))
+                embeddings.append(embedding.squeeze().cpu().numpy())
+                valid_segments.append((start, end))
+
+        return np.array(embeddings), valid_segments
+
+    def cluster_speakers(self, embeddings, min_speakers=None, max_speakers=None, threshold=0.6):
+        """Cluster embeddings using agglomerative clustering with cosine distance."""
+        if len(embeddings) <= 1:
+            return [0] * len(embeddings)
+
+        # Compute pairwise cosine distances
+        distances = pdist(embeddings, metric="cosine")
+        linkage_matrix = linkage(distances, method="average")
+
+        if max_speakers:
+            # If we know max speakers, cut to that many clusters
+            labels = fcluster(linkage_matrix, t=max_speakers, criterion="maxclust")
+        else:
+            # Use distance threshold
+            labels = fcluster(linkage_matrix, t=threshold, criterion="distance")
+
+        # Enforce min_speakers if specified
+        if min_speakers and len(set(labels)) < min_speakers:
+            labels = fcluster(linkage_matrix, t=min_speakers, criterion="maxclust")
+
+        # Relabel to SPEAKER_00, SPEAKER_01, ... in order of first appearance
+        seen = {}
+        relabeled = []
+        counter = 0
+        for label in labels:
+            if label not in seen:
+                seen[label] = counter
+                counter += 1
+            relabeled.append(seen[label])
+
+        return relabeled
+
+    def diarize(self, audio_path, min_speakers=None, max_speakers=None, threshold=0.6):
+        """Full diarization pipeline: VAD → embeddings → clustering."""
+        # Convert to WAV
+        wav_path = tempfile.mktemp(suffix=".wav")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", audio_path,
+             "-ar", str(SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", wav_path],
+            capture_output=True, check=True
+        )
+
+        try:
+            # Detect speech segments
+            speech_segments = self.detect_speech_segments(wav_path)
+
+            # Load audio
+            waveform, sr = torchaudio.load(wav_path)
+
+            # Extract embeddings
+            embeddings, valid_segments = self.extract_embeddings(waveform, sr, speech_segments)
+
+            if len(embeddings) == 0:
+                return {"speakers": 0, "segments": []}
+
+            # Cluster
+            labels = self.cluster_speakers(
+                embeddings,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                threshold=threshold
+            )
+
+            # Build result
+            segments = []
+            for (start, end), label in zip(valid_segments, labels):
+                segments.append({
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "speaker": f"SPEAKER_{label:02d}"
+                })
+
+            return {
+                "speakers": len(set(labels)),
+                "segments": segments
+            }
+        finally:
+            os.unlink(wav_path)
+
+
+class DiarizeHandler(BaseHTTPRequestHandler):
+    engine = None
+
+    def do_POST(self):
+        if self.path != "/diarize":
+            self.send_error(404)
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in content_type:
+            self.send_error(400, "Expected multipart/form-data")
+            return
+
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type}
+        )
+
+        file_item = form["file"]
+        min_speakers = int(form.getvalue("min_speakers")) if "min_speakers" in form else None
+        max_speakers = int(form.getvalue("max_speakers")) if "max_speakers" in form else None
+        threshold = float(form.getvalue("threshold", "0.6"))
+
+        # Save uploaded file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(file_item.file.read())
+            tmp_path = tmp.name
+
+        try:
+            result = self.engine.diarize(
+                tmp_path,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                threshold=threshold
+            )
+
+            response = json.dumps(result).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+        finally:
+            os.unlink(tmp_path)
+
+    def log_message(self, format, *args):
+        sys.stderr.write(f"[diarize] {args[0]}\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Speaker diarization server")
+    parser.add_argument("--port", type=int, default=8100)
+    parser.add_argument("--device", default=DEVICE, help="cpu, cuda, or mps")
+    args = parser.parse_args()
+
+    print(f"Loading ECAPA-TDNN model on {args.device}...", flush=True)
+    engine = DiarizationEngine(device=args.device)
+    DiarizeHandler.engine = engine
+
+    print(f"Diarization server running on http://0.0.0.0:{args.port}/diarize", flush=True)
+    server = HTTPServer(("0.0.0.0", args.port), DiarizeHandler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    whisper (0.1.0)
+    whisper (0.2.0)
 
 GEM
   remote: https://rubygems.org/

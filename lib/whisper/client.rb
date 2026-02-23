@@ -35,6 +35,46 @@ module Whisper
       format_results(results, timestamps:)
     end
 
+    def transcribe_with_speakers(input_path, language: "auto",
+                                  min_speakers: nil, max_speakers: nil, speaker_names: {},
+                                  on_progress: nil)
+      # 1. Diarize first — speaker segments are leading
+      on_progress&.call(:diarize, 0, 1, 0.0, 0.0)
+      diarization = Diarization.diarize(
+        input_path,
+        min_speakers: min_speakers,
+        max_speakers: max_speakers
+      )
+      on_progress&.call(:diarize, 1, 1, 0.0, 0.0)
+
+      # 2. Merge adjacent segments from same speaker to reduce whisper calls
+      speaker_segments = Diarization.merge_adjacent(diarization[:segments])
+
+      # 3. Transcribe each speaker segment
+      results = Dir.mktmpdir("whisper_") do |tmpdir|
+        speaker_segments.each_with_index.map do |seg, i|
+          chunk_path = File.join(tmpdir, format("chunk_%03d.wav", i))
+          chunk_length = seg[:end] - seg[:start]
+
+          on_progress&.call(:transcribe, i, speaker_segments.size, seg[:start], seg[:end])
+
+          convert_to_wav(input_path, chunk_path, start: seg[:start], duration: chunk_length)
+          text = send_to_whisper(chunk_path, language:)
+
+          {
+            start: seg[:start],
+            end: seg[:end],
+            speaker: seg[:speaker],
+            text: clean_repetitions(text)
+          }
+        end
+      end
+
+      results = Diarization.apply_speaker_names(results, speaker_names) if speaker_names.any?
+
+      { speakers: diarization[:speakers], segments: results }
+    end
+
     def transcribe_short(input_path, language: "auto")
       wav_path = "#{input_path}.wav"
       convert_to_wav(input_path, wav_path)
