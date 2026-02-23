@@ -20,13 +20,14 @@ API:
 """
 
 import argparse
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import cgi
 
 import numpy as np
 import torch
@@ -69,7 +70,6 @@ class DiarizationEngine:
         silences = []
         pending_start = None
         for line in result.stderr.splitlines():
-            import re
             m = re.search(r"silence_start: ([\d.]+)", line)
             if m:
                 pending_start = float(m.group(1))
@@ -191,6 +191,44 @@ class DiarizationEngine:
             os.unlink(wav_path)
 
 
+def parse_multipart(rfile, content_type, content_length):
+    boundary_match = re.search(r"boundary=(.+)", content_type)
+    if not boundary_match:
+        return {}, {}
+    boundary = boundary_match.group(1).encode()
+    if boundary.startswith(b'"') and boundary.endswith(b'"'):
+        boundary = boundary[1:-1]
+
+    raw = rfile.read(content_length)
+    parts_raw = raw.split(b"--" + boundary)
+
+    fields = {}
+    files = {}
+
+    for part in parts_raw:
+        if part in (b"", b"--\r\n", b"--"):
+            continue
+        part = part.strip(b"\r\n")
+        if b"\r\n\r\n" not in part:
+            continue
+        header_section, body = part.split(b"\r\n\r\n", 1)
+        if body.endswith(b"\r\n"):
+            body = body[:-2]
+
+        headers = header_section.decode(errors="replace")
+        name_match = re.search(r'name="([^"]+)"', headers)
+        if not name_match:
+            continue
+        name = name_match.group(1)
+
+        if "filename=" in headers:
+            files[name] = body
+        else:
+            fields[name] = body.decode(errors="replace")
+
+    return fields, files
+
+
 class DiarizeHandler(BaseHTTPRequestHandler):
     engine = None
 
@@ -204,20 +242,19 @@ class DiarizeHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Expected multipart/form-data")
             return
 
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type}
-        )
+        content_length = int(self.headers.get("Content-Length", 0))
+        fields, files = parse_multipart(self.rfile, content_type, content_length)
 
-        file_item = form["file"]
-        min_speakers = int(form.getvalue("min_speakers")) if "min_speakers" in form else None
-        max_speakers = int(form.getvalue("max_speakers")) if "max_speakers" in form else None
-        threshold = float(form.getvalue("threshold", "0.6"))
+        if "file" not in files:
+            self.send_error(400, "Missing 'file' field")
+            return
 
-        # Save uploaded file
+        min_speakers = int(fields["min_speakers"]) if "min_speakers" in fields else None
+        max_speakers = int(fields["max_speakers"]) if "max_speakers" in fields else None
+        threshold = float(fields.get("threshold", "0.6"))
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(file_item.file.read())
+            tmp.write(files["file"])
             tmp_path = tmp.name
 
         try:
