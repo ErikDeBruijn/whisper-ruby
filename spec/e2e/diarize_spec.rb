@@ -1,4 +1,5 @@
 require "spec_helper"
+require "tempfile"
 require_relative "../support/tts_audio"
 
 RSpec.describe "Diarization E2E", :e2e do
@@ -57,6 +58,52 @@ RSpec.describe "Diarization E2E", :e2e do
       expect(speakers).to include("Alice").or include("Bob")
       expect(speakers).not_to include("SPEAKER_00")
       expect(speakers).not_to include("SPEAKER_01")
+    end
+  end
+
+  describe "voice profile resolution" do
+    let(:speaker_a_text) { "Hello, my name is Daniel and I work in engineering at a large technology company." }
+    let(:speaker_b_text) { "Hi Daniel, I am Samantha and I handle marketing for our product division." }
+
+    let(:audio_path) do
+      TTSAudio.generate_multispeaker([
+        { text: speaker_a_text, voice: "Daniel" },
+        { text: speaker_b_text, voice: "Samantha" }
+      ], silence_gap: 2.0)
+    end
+
+    let(:enroll_a_path) do
+      TTSAudio.generate_segment(
+        "This is a sample of my voice for enrollment purposes. I speak clearly and at a normal pace.",
+        voice: "Daniel"
+      )
+    end
+
+    let(:enroll_b_path) do
+      TTSAudio.generate_segment(
+        "This is a sample of my voice for enrollment purposes. I speak clearly and at a normal pace.",
+        voice: "Samantha"
+      )
+    end
+
+    let(:profiles) do
+      tmpfile = Tempfile.new(["profiles", ".json"])
+      lib = Whisper::VoiceProfileLibrary.new(tmpfile.path)
+      Whisper::VoiceProfile.learn_voiceprint("PersonA", enroll_a_path, library: lib)
+      Whisper::VoiceProfile.learn_voiceprint("PersonB", enroll_b_path, library: lib)
+      lib
+    end
+
+    it "resolves speakers to enrolled profile names" do
+      result = client.transcribe_with_speakers(
+        audio_path,
+        language: "en",
+        min_speakers: 2,
+        voice_profiles: profiles
+      )
+
+      speakers = result[:segments].map { |s| s[:speaker] }.uniq
+      expect(speakers).to include("PersonA").or include("PersonB")
     end
   end
 
