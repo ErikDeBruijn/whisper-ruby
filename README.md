@@ -98,5 +98,8 @@ gem "whisper", github: "erikdebruijn/whisper-ruby"
 
 ```bash
 bundle install
-bundle exec rspec
+bundle exec rspec              # unit specs only (17 examples)
+RUN_E2E=1 bundle exec rspec   # includes E2E specs (requires running servers)
 ```
+
+E2E specs generate test audio via macOS TTS (`say`), send it to Whisper and the diarize-server, and verify the roundtrip. They require both `WHISPER_URL` and `DIARIZE_URL` servers to be running.
